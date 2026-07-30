@@ -9,6 +9,7 @@
 #include <dlfcn.h>
 #include "out.h"
 #include "tf_driver.h"
+#include "dspr2_prof.h"
 
 #define IN_RATE     44100
 #define OUT_RATE    48000
@@ -90,10 +91,14 @@ static int sf3000_busy(void) {
  * step = (IN_RATE << 16) / OUT_RATE ≈ 60211 (0xEB33). */
 static void sf3000_feed(void *buf, int bytes) {
     if (!g_active || !p_playframe || !buf || bytes <= 0) return;
+    PROF_AUDIO_BEGIN();
 
     const int16_t *src = (const int16_t *)buf;
     int in_frames = bytes / 4;
-    if (in_frames <= 0) return;
+    if (in_frames <= 0) {
+        PROF_AUDIO_END();
+        return;
+    }
 
     const uint32_t step = (uint32_t)(((uint64_t)IN_RATE << 16) / OUT_RATE);
     uint32_t phase = g_phase;
@@ -140,6 +145,7 @@ static void sf3000_feed(void *buf, int bytes) {
             g_out_buf[i] = (int16_t)(((int)g_out_buf[i] * g_gain_q8) >> 8);
     }
     if (out_idx > 0) p_playframe(g_out_buf, out_idx);
+    PROF_AUDIO_END();
 }
 
 void out_register_sf3000(struct out_driver *drv) {

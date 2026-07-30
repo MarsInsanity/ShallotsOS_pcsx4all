@@ -16,13 +16,19 @@ RM  = rm -f
 MD  = mkdir -p
 
 C_ARCH = -mips32r2 -march=mips32r2 -mtune=74kc -mdspr2 -mfp32 -mhard-float \
-         -mlong-calls -EL --sysroot=$(SYSROOT) \
+         -EL --sysroot=$(SYSROOT) \
          -DSHMEM_MIRRORING -DMIPS_HAS_R2_INSTS
+
+# The executable is ~1 MB and lives wholly inside one MIPS J/JAL region.
+# -mlong-calls made almost every internal call materialize a full address and
+# use jalr (2305 sites in the old binary) for no benefit. Let the compiler emit
+# direct jal calls; external shared-library calls still use the normal PLT/GOT.
 
 MCD1_FILE = \"mcd001.mcr\"
 MCD2_FILE = \"mcd002.mcr\"
 
-CFLAGS  = $(C_ARCH) -Ofast -DNDEBUG \
+CFLAGS  = $(C_ARCH) -Ofast -flto -fuse-linker-plugin -fno-strict-aliasing \
+          -mno-check-zero-division -DNDEBUG \
           -Wall -Wunused -Wpointer-arith \
           -Wno-sign-compare -Wno-cast-align \
           -Isrc -Isrc/spu/$(SPU) -D$(SPU) -Isrc/gpu/$(GPU) \
@@ -41,12 +47,6 @@ ifdef RECOMPILER
 CFLAGS += -DPSXREC -D$(RECOMPILER)
 endif
 
-# Skip D-cache flush on dynarec code-cache flush (ICACHE-only, like the rs97/
-# amini/gcw0 MIPS ports). Big CPU win for code-flush-heavy games (e.g. THPS3).
-# Correctness risk: relies on HW making generated code visible to I-fetch
-# without explicit D-cache writeback. Verify stability before shipping.
-CFLAGS += -DDYNAREC_SKIP_DCACHE_FLUSH
-
 # Opt-in extra flags, e.g. make -f Makefile.sf3000 EXTRA_CFLAGS=-DDSPR2_PROFILE
 CFLAGS += $(EXTRA_CFLAGS)
 
@@ -54,7 +54,8 @@ LDFLAGS = -mips32r2 -mhard-float -mfp32 -EL \
           --sysroot=$(SYSROOT) \
           -L$(SYSROOT)/usr/lib \
           -lc -lgcc -lm -lpthread -lrt -lz -ldl \
-          -Wl,--as-needed -Wl,--gc-sections
+          -flto -fuse-linker-plugin \
+          -Wl,-O1 -Wl,--as-needed -Wl,--gc-sections
 
 OBJDIRS = obj obj/gpu obj/gpu/$(GPU) obj/gpu/gpulib obj/spu obj/spu/$(SPU) \
           obj/recompiler obj/recompiler/$(RECOMPILER) \

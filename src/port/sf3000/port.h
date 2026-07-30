@@ -16,7 +16,10 @@
 #define PATH_MAX 2048
 #endif
 
-extern char cheatsdir[PATH_MAX];
+/* The definition sees libc's PATH_MAX while some users of this header use the
+ * conservative fallback above. The bound is irrelevant to callers and making
+ * it part of the extern type causes an LTO type-mismatch warning. */
+extern char cheatsdir[];
 
 struct ps1_controller {
     uint8_t id;
@@ -33,7 +36,7 @@ struct ps1_controller {
 
 extern struct ps1_controller player_controller[2];
 
-#define CONFIG_VERSION 0
+#define CONFIG_VERSION 1
 
 unsigned get_ticks(void);
 void wait_ticks(unsigned s);

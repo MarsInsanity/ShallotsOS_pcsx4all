@@ -51,6 +51,41 @@
 
 static void plog(const char *msg);
 
+#ifdef DSPR2_PROFILE
+static int profile_read_one_line(const char *path, char *out, size_t out_size) {
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    if (!fgets(out, out_size, f)) {
+        fclose(f);
+        return 0;
+    }
+    fclose(f);
+    out[strcspn(out, "\r\n")] = '\0';
+    return 1;
+}
+
+static void profile_dump_cpu_policy(void) {
+    for (int cpu = 0; cpu < 8; cpu++) {
+        char path[160], governor[32], cur[32], min[32], max[32];
+        snprintf(path, sizeof path,
+                 "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_governor", cpu);
+        if (!profile_read_one_line(path, governor, sizeof governor)) continue;
+        snprintf(path, sizeof path,
+                 "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_cur_freq", cpu);
+        if (!profile_read_one_line(path, cur, sizeof cur)) strcpy(cur, "?");
+        snprintf(path, sizeof path,
+                 "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_min_freq", cpu);
+        if (!profile_read_one_line(path, min, sizeof min)) strcpy(min, "?");
+        snprintf(path, sizeof path,
+                 "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_max_freq", cpu);
+        if (!profile_read_one_line(path, max, sizeof max)) strcpy(max, "?");
+        fprintf(stderr,
+                "PCSX4ALL_PROFILE_CPUFREQ: cpu%d governor=%s cur=%s min=%s max=%s\n",
+                cpu, governor, cur, min, max);
+    }
+}
+#endif
+
 uint8_t use_speedup = 0;
 void update_window_size(int w, int h) {
     if (w == SCREEN_WIDTH && h == SCREEN_HEIGHT) return;
@@ -891,7 +926,9 @@ uint16_t pad_read(int num) { return (num == 0 ? pad1 : 0xFFFF); }
 void video_flip(void) {
     if (Config.ShowFps) port_printf(2, 2, pl_data.stats_msg);
     gamma_apply(SCREEN, SCREEN_WIDTH * SCREEN_HEIGHT);
+    PROF_PRESENT_BEGIN();
     display_blit(SCREEN, SCREEN_WIDTH, SCREEN_HEIGHT, SCREEN_WIDTH * 2);
+    PROF_PRESENT_END();
     PROF_FRAME_TICK();
 }
 
@@ -1051,14 +1088,23 @@ static int sf_adc_read(int slot) {
     return (read(fd[slot], &b, 1) == 1) ? b : -1;
 }
 static int sf_batt_pct(int *charging) {
-    int a1 = sf_adc_read(0), a5 = sf_adc_read(1);
-    *charging = (a5 >= 64) ? 1 : 0;
-    if (a1 < 0) return -1;
-    static const int rx[] = {64,153,224,255}, py[] = {0,50,80,100};
-    if (a1 <= rx[0]) return 0;
-    for (int i = 1; i < 4; i++) if (a1 <= rx[i]) {
-        int sp = rx[i]-rx[i-1]; return py[i-1] + (py[i]-py[i-1])*(a1-rx[i-1])/(sp?sp:1); }
-    return 100;
+    /* Re-read ~every 5s; the menu redraws continuously. */
+    static int cached = -1, cached_chg = 0; static time_t last = 0;
+    time_t now = time(NULL);
+    if (cached < 0 || now - last >= 5) {
+        last = now;
+        int a1 = sf_adc_read(0), a5 = sf_adc_read(1);
+        cached_chg = (a5 >= 64) ? 1 : 0;
+        cached = -1;
+        if (a1 >= 0) {
+            static const int rx[] = {64,153,224,255}, py[] = {0,50,80,100};
+            if (a1 <= rx[0]) cached = 0;
+            else { cached = 100; for (int i = 1; i < 4; i++) if (a1 <= rx[i]) {
+                int sp = rx[i]-rx[i-1]; cached = py[i-1] + (py[i]-py[i-1])*(a1-rx[i-1])/(sp?sp:1); break; } }
+        }
+    }
+    *charging = cached_chg;
+    return cached;
 }
 static int sf_batt_color_mode(void) {
     static int c = -1;
@@ -1071,15 +1117,14 @@ static void sf_draw_battery(void) {
     int charging, pct = sf_batt_pct(&charging);
     if (pct < 0) return; if (pct > 100) pct = 100;
     int pad = 14, y = 12;
-    if (sf_batt_color_mode()) {
-        uint16_t c = charging ? 0x2FE6 : (pct>=70)?0x2FE6 : (pct>=30)?0x041F : 0xF800;
-        int d = 14; sf_fill_round(sf_tw - pad - d, y, d, d, d/2, c);
-        return;
-    }
     int bw = 30, bh = 15, nub = 3, p = 2;
     int x = sf_tw - pad - bw - nub;
     uint16_t out = sf_col_text;
-    uint16_t fillc = charging ? 0x2FE6 : (pct<=15)?0xF800 : sf_col_text;
+    uint16_t fillc;
+    if (sf_batt_color_mode())
+        fillc = charging ? 0x2FE6 : (pct>=70)?0x2FE6 : (pct>=30)?0x041F : 0xF800;
+    else
+        fillc = charging ? 0x2FE6 : (pct<=15)?0xF800 : sf_col_text;
     /* outline (rounded), hollow interior, nub, fill */
     sf_fill_round(x, y, bw, bh, 4, out);
     sf_fill_round(x+1, y+1, bw-2, bh-2, 3, 0x0000);
@@ -1188,12 +1233,17 @@ int config_have_game(void) {   /* does a per-game override exist? */
     FILE *f = fopen(p, "r"); if (f) { fclose(f); return 1; } return 0;
 }
 
-static void config_read(const char *path) {
+static int config_read(const char *path) {
     FILE *f = fopen(path, "r");
-    if (!f) return;
+    if (!f) return -1;
+
+#ifdef DSPR2_PROFILE
+    fprintf(stderr, "PCSX4ALL_PROFILE_CONFIG_FILE: %s\n", path);
+#endif
 
     char line[512];
     int linenum = 0;
+    int version = -1;
     while (fgets(line, sizeof(line), f)) {
         char *arg = strchr(line, ' ');
         if (!arg) continue;
@@ -1203,7 +1253,10 @@ static void config_read(const char *path) {
         linenum++;
         int v; sscanf(arg, "%d", &v);
 
-        if (!strcmp(line,"CONFIG_VERSION")) { if (v != 0) break; }
+        if (!strcmp(line,"CONFIG_VERSION")) {
+            version = v;
+            if (v < 0 || v > CONFIG_VERSION) break;
+        }
         else if (!strncmp(line,"PsxBind",7)) { int idx = atoi(line+7); if (idx >= 0 && idx < PB_COUNT) pb_bind[idx] = v; }
         else if (!strcmp(line,"Xa"))              Config.Xa = v;
         else if (!strcmp(line,"Mdec"))            Config.Mdec = v;
@@ -1249,26 +1302,54 @@ static void config_read(const char *path) {
         else if (!strcmp(line,"Gamma"))       gamma_percent = (v < 100 ? 100 : (v > 250 ? 250 : v));
     }
     fclose(f);
+    return version;
+}
+
+static void config_write(const char *path);
+
+/* v0 was shipped with 16 SPU events per emulated frame and the FPS overlay
+ * enabled. On R36SX that produces dozens of tiny audio submissions for every
+ * displayed frame. Upgrade only those old defaults; all user controls, BIOS,
+ * video quality, and per-game settings remain intact. Once rewritten as v1,
+ * an explicit user choice of either setting is respected. */
+static int config_migrate_v0(void) {
+    int changed = 0;
+    if (Config.SpuUpdateFreq == SPU_UPDATE_FREQ_16) {
+        Config.SpuUpdateFreq = SPU_UPDATE_FREQ_1;
+        changed = 1;
+    }
+    if (Config.ShowFps == 1) {
+        Config.ShowFps = 0;
+        changed = 1;
+    }
+    return changed;
 }
 
 /* Load global config, then layer the per-game override on top (if any). */
 void config_load(void) {
     char p[PATH_MAX];
     snprintf(p, sizeof p, "%s/pcsx4all.cfg", homedir);
-    config_read(p);
+    int version = config_read(p);
+    if (version == 0) {
+        config_migrate_v0();
+        config_write(p);
+    }
     config_game_path(p, sizeof p);
-    config_read(p);   /* no-op if absent; overrides global where present */
+    version = config_read(p);   /* no-op if absent; overrides global */
+    if (version == 0 && config_migrate_v0())
+        config_write(p);
 }
 
 static void config_write(const char *path) {
     FILE *f = fopen(path, "w");
     if (!f) return;
-    fprintf(f, "CONFIG_VERSION 0\n"
+    fprintf(f, "CONFIG_VERSION %d\n"
                "Xa %d\nMdec %d\nPsxAuto %d\nCdda %d\nHLE %d\n"
                "RCntFix %d\nVSyncWA %d\nCpu %d\nPsxType %d\n"
                "SpuIrq %d\nSyncAudio %d\nSpuUpdateFreq %d\n"
                "ForcedXAUpdates %d\nShowFps %d\nFrameLimit %d\n"
                "FrameSkip %d\nAnalogArrow %d\nAnalog_Mode %d\n",
+            CONFIG_VERSION,
             Config.Xa, Config.Mdec, Config.PsxAuto, Config.Cdda, Config.HLE,
             Config.RCntFix, Config.VSyncWA, Config.Cpu, Config.PsxType,
             Config.SpuIrq, Config.SyncAudio, Config.SpuUpdateFreq,
@@ -1455,10 +1536,13 @@ int main(int argc, char *argv[]) {
     plog("main: start");
     if (argc < 2) { plog("main: no ROM arg, exit"); return 1; }
     plog(argv[1]);
+#ifdef DSPR2_PROFILE
+    profile_dump_cpu_policy();
+#endif
     /* Defaults */
     Config.Xa = 0; Config.Mdec = 0; Config.PsxAuto = 1;
     Config.Cdda = 0; Config.HLE = 0;  /* 0=BIOS (preferred); psxMemInit falls back to HLE if missing */
-    Config.SpuUpdateFreq = 4; Config.ForcedXAUpdates = 1;
+    Config.SpuUpdateFreq = SPU_UPDATE_FREQ_1; Config.ForcedXAUpdates = 1;
     Config.ShowFps = 0; Config.FrameLimit = 1; Config.FrameSkip = -1;
 #ifdef PSXREC
     /* Stock 0x200 (2.0).  LOWERING it makes each instruction cost fewer cycles,
@@ -1474,9 +1558,12 @@ int main(int argc, char *argv[]) {
      * cfg pointing at an empty path. */
 
 #ifdef GPU_UNAI
-    gpu_unai_config_ext.lighting     = 0;
+    /* Hardware profiling in Tekken 3 showed full lighting and blending cost
+     * no measurable frame time versus the degraded fast settings. Keep the
+     * correct image and take the proven performance win from sane SPU pacing. */
+    gpu_unai_config_ext.lighting     = 1;
     gpu_unai_config_ext.fast_lighting= 1;
-    gpu_unai_config_ext.blending     = 0;
+    gpu_unai_config_ext.blending     = 1;
     gpu_unai_config_ext.dithering    = 0;
     gpu_unai_config_ext.clip_368     = 0;
     /* SF3000: keep GPU output full-quality by default — NO line skipping
@@ -1499,7 +1586,35 @@ int main(int argc, char *argv[]) {
 
     /* ROM path first, so config_load() can find the per-game override. */
     if (argc >= 2) strncpy(g_rom_path, argv[1], sizeof(g_rom_path)-1);
+    mkdir(homedir, 0755);
     config_load();   /* global config, then per-game override on top */
+
+#ifdef DSPR2_PROFILE
+    fprintf(stderr,
+            "PCSX4ALL_PROFILE_CONFIG: cpu=%d frameskip=%d limit=%d cycle=%03x "
+            "lighting=%d fast_lighting=%d blending=%d dithering=%d "
+            "pixel_skip=%d ilace_force=%d spu_interp=%d spu_reverb=%d "
+            "scale=%d hires_fix=%d gamma=%d\n",
+            Config.Cpu, Config.FrameSkip, Config.FrameLimit,
+#ifdef PSXREC
+            cycle_multiplier,
+#else
+            0,
+#endif
+#ifdef GPU_UNAI
+            gpu_unai_config_ext.lighting, gpu_unai_config_ext.fast_lighting,
+            gpu_unai_config_ext.blending, gpu_unai_config_ext.dithering,
+            gpu_unai_config_ext.pixel_skip, gpu_unai_config_ext.ilace_force,
+#else
+            0, 0, 0, 0, 0, 0,
+#endif
+#ifdef SPU_PCSXREARMED
+            spu_config.iUseInterpolation, spu_config.iUseReverb,
+#else
+            0, 0,
+#endif
+            scale_mode, hires_fix, gamma_percent);
+#endif
 
     /* Memory cards: the sf3000 port never set these, so Config.Mcd1/2 were
      * empty → BIOS reported "no card" → games couldn't save. Point them at
@@ -1541,6 +1656,10 @@ int main(int argc, char *argv[]) {
     {
         extern R3000Acpu psxRec;
         plog(psxCpu == &psxRec ? "dynarec ACTIVE" : "INTERPRETER (slow!)");
+#ifdef DSPR2_PROFILE
+        fprintf(stderr, "PCSX4ALL_PROFILE_CPU: %s\n",
+                psxCpu == &psxRec ? "dynarec" : "INTERPRETER");
+#endif
     }
 
     /* This port hand-rolls plugin init and never calls LoadPlugins(), so do the
