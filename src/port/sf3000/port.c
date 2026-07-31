@@ -591,7 +591,19 @@ static void sf_fill_round(int x, int y, int w, int h, int r, uint16_t c);
 static uint16_t sf_col_text, sf_col_sel, sf_col_seltext;
 static int sf_tw, sf_th;   /* current draw-target dims (panel res in menus) */
 static void sf_draw_battery(void);
+static int  sf_batt_pct(int *charging);
 static char g_rom_path[1024];   /* current ROM path (defined below) */
+
+/* Menu dirty gate: the menu loops call sf_menu_draw() ~60Hz, but the panel only
+ * changes on input. Presenting an unchanged frame every 16ms tears/flickers on
+ * SF3500's disp_frame present path (fine on other devices, timing masks it).
+ * Hash the visible state and skip begin+redraw+present when it's unchanged, like
+ * FrogUI's own dirty gate. Any code that paints the panel outside sf_menu_draw
+ * (toasts, the remap capture screen, GameMenu) must call sf_menu_invalidate() so
+ * the menu repaints over it on return. */
+static unsigned sf_menu_sig = 0;
+static int      sf_menu_force = 1;
+static void sf_menu_invalidate(void) { sf_menu_force = 1; }
 
 /* Reusable themed menu list: header + scrolling items + pill selection + hint,
  * matching picoarch/FrogUI. Handles lists longer than the screen (scrolls to keep
@@ -606,9 +618,23 @@ static void sf_menu_toast(const char *msg) {
     sf_text(x, y, msg, sf_col_seltext);
     sf3000_menu_present();
     usleep(650000);
+    sf_menu_invalidate();   /* menu must repaint over the toast */
 }
 static void sf_menu_draw(const char *title, const char *const *items, int n,
                          int sel, const char *hint) {
+    {   /* skip the whole redraw+present when nothing visible changed */
+        int chg = 0, pct = sf_batt_pct(&chg);
+        unsigned sig = 5381u;
+        #define SFH(x) do { sig = sig*33u + (unsigned)(x); } while (0)
+        SFH(n); SFH(sel); SFH(pct); SFH(chg);
+        for (const char *p = title; p && *p; p++) SFH((unsigned char)*p);
+        for (const char *p = hint;  p && *p; p++) SFH((unsigned char)*p);
+        for (int i = 0; i < n; i++)
+            for (const char *p = items[i]; p && *p; p++) SFH((unsigned char)*p);
+        #undef SFH
+        if (!sf_menu_force && sig == sf_menu_sig) return;
+        sf_menu_sig = sig; sf_menu_force = 0;
+    }
     if (!sf3000_menu_begin()) {   /* not ready: bitmap fallback on SCREEN */
         video_clear();
         port_printf(2, 0, title);
@@ -655,6 +681,7 @@ static void sf_menu_draw(const char *title, const char *const *items, int n,
 static void sf3000_controls_menu(void) {
     int sel = 0;
     uint32_t prev = cv_keys ? *cv_keys : 0;
+    sf_menu_invalidate();   /* force first paint */
     while (1) {
         char rows[PB_COUNT][64]; const char *items[PB_COUNT];
         for (int i = 0; i < PB_COUNT; i++) {
@@ -695,6 +722,7 @@ static void sf3000_controls_menu(void) {
             }
             while (cv_keys && *cv_keys) usleep(10000);       /* wait release */
             prev = cv_keys ? *cv_keys : 0;
+            sf_menu_invalidate();   /* repaint list over the capture screen */
         }
     }
 }
@@ -703,6 +731,7 @@ static void sf3000_menu(void) {
     int sel = 0;
     uint32_t prev = cv_keys ? *cv_keys : 0;
     fb1_blank(0);   /* show battery while in pause menu */
+    sf_menu_invalidate();   /* force first paint */
 
     while (1) {
         char scale_label[48];
@@ -814,12 +843,14 @@ static void sf3000_menu(void) {
                     GameMenu();
                     prev = cv_keys ? *cv_keys : 0;
                     last_fb_y_off = -1; last_fb_y_len = -1;
+                    sf_menu_invalidate();   /* repaint over PCSX Settings screens */
                     break;
                 }
                 case 9: {  /* Controls (remap) */
                     while (cv_keys && btn(*cv_keys, CV_A)) usleep(10000);
                     sf3000_controls_menu();
                     prev = cv_keys ? *cv_keys : 0;   /* NOT auto-saved: use Save Config */
+                    sf_menu_invalidate();   /* repaint over the controls screen */
                     break;
                 }
                 case 10: {  /* Save Config (global) */
@@ -1097,9 +1128,9 @@ static int sf_batt_pct(int *charging) {
         cached_chg = (a5 >= 64) ? 1 : 0;
         cached = -1;
         if (a1 >= 0) {
-            static const int rx[] = {64,153,224,255}, py[] = {0,50,80,100};
+            static const int rx[] = {64,153,224}, py[] = {0,50,100};
             if (a1 <= rx[0]) cached = 0;
-            else { cached = 100; for (int i = 1; i < 4; i++) if (a1 <= rx[i]) {
+            else { cached = 100; for (int i = 1; i < 3; i++) if (a1 <= rx[i]) {
                 int sp = rx[i]-rx[i-1]; cached = py[i-1] + (py[i]-py[i-1])*(a1-rx[i-1])/(sp?sp:1); break; } }
         }
     }
@@ -1194,6 +1225,11 @@ void wait_ticks(unsigned us) {
 static char homedir[PATH_MAX]    = "/mnt/sdcard/cubegm/cores/.pcsx4all";
 char        sstatesdir[PATH_MAX] = "/mnt/sdcard/cubegm/cores/.pcsx4all/savestates";
 char        cheatsdir[PATH_MAX]  = "/mnt/sdcard/cubegm/cores/.pcsx4all/cheats";
+
+#define SHARED_BIOS_DIR          "/mnt/sdcard/cubegm/bios"
+#define LEGACY_CORES_BIOS_DIR    "/mnt/sdcard/cubegm/cores/.pcsx4all/bios"
+#define LEGACY_PCSX4ALL_DIR      "/mnt/sdcard/cubegm/.pcsx4all"
+#define LEGACY_PCSX4ALL_BIOS_DIR "/mnt/sdcard/cubegm/.pcsx4all/bios"
 
 struct ps1_controller player_controller[2] = {{0},{0}};
 
@@ -1482,8 +1518,8 @@ static void write_recent_screenshot(void) {
 }
 
 /* Auto-detect a PS1 BIOS so users don't have to name it exactly scph1001.bin.
- * Probe the shared cubegm/bios dir first (what the docs recommend), then the
- * legacy .pcsx4all dir. Accept any 512 KB (0x80000) file, preferring an scph*
+ * Probe the shared cubegm/bios dir first, then every layout used by older
+ * PCSX4ALL releases. Accept any 512 KB (0x80000) file, preferring an scph*
  * name; point Config at the first match. psxMemInit then loads it (HLE only if
  * nothing valid is found). */
 static int probe_bios_dir(const char *dir) {
@@ -1527,8 +1563,11 @@ static void probe_bios(void) {
      * no HLE override. Only auto-detect when it's unset or the file is missing;
      * on a guess we switch HLE off so the found BIOS is actually used. */
     if (bios_present(Config.BiosDir, Config.Bios)) return;
-    if (probe_bios_dir("/mnt/sdcard/cubegm/bios")) return;
+    if (probe_bios_dir(SHARED_BIOS_DIR)) return;
     if (probe_bios_dir(homedir)) return;
+    if (probe_bios_dir(LEGACY_CORES_BIOS_DIR)) return;
+    if (probe_bios_dir(LEGACY_PCSX4ALL_DIR)) return;
+    if (probe_bios_dir(LEGACY_PCSX4ALL_BIOS_DIR)) return;
     /* nothing found anywhere: leave config_load()'s values; psxMemInit HLEs. */
 }
 
@@ -1628,11 +1667,10 @@ int main(int argc, char *argv[]) {
         snprintf(Config.Mcd2, sizeof(Config.Mcd2), "%s/mcd002.mcr", mcddir);
     }
 
-    /* BIOS auto-detect: if a real BIOS is present in cubegm/bios (or the legacy
-     * .pcsx4all dir), point Config at it and force HLE off — so just dropping the
-     * file in place "just works", no menu dance, even if a stale pcsx4all.cfg
-     * (loaded above) still points HLE on or at an empty path. If none is found we
-     * leave config_load()'s values and psxMemInit() HLE-falls-back. */
+    /* BIOS auto-detect: if a real BIOS is present in cubegm/bios or any legacy
+     * .pcsx4all location, point Config at it and force HLE off — so just
+     * dropping the file in place works, even if a stale pcsx4all.cfg still
+     * points HLE on or at an empty path. */
     probe_bios();
 
     /* ROM from command line arg 1 */
