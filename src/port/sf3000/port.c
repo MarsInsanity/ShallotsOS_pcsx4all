@@ -987,6 +987,48 @@ static unsigned char *sf_font_buf = NULL;
 static float sf_font_scale = 0;
 static int   sf_font_asc = 0;           /* scaled ascent (baseline offset) */
 static int   sf_font_ready = 0;
+
+/* Rasterize menu glyphs once. Rebuilding every glyph into a stack bitmap on
+ * every redraw made SF3500 firmware 1.1 vulnerable to transient stb_truetype
+ * allocation failures and lengthened the display-DMA race window. This mirrors
+ * picoarch's persistent menu glyph cache. */
+#define SF_GLYPH_FIRST 32
+#define SF_GLYPH_LAST  126
+#define SF_GLYPH_COUNT (SF_GLYPH_LAST - SF_GLYPH_FIRST + 1)
+#define SF_GLYPH_MAX   48
+typedef struct {
+    unsigned char ready;
+    short w, h, x0, y0;
+    int glyph_index;
+    int advance;
+    unsigned char bitmap[SF_GLYPH_MAX * SF_GLYPH_MAX];
+} sf_glyph_t;
+static sf_glyph_t sf_glyphs[SF_GLYPH_COUNT];
+
+static sf_glyph_t *sf_glyph_get(unsigned char c) {
+    if (c < SF_GLYPH_FIRST || c > SF_GLYPH_LAST) return NULL;
+    sf_glyph_t *g = &sf_glyphs[c - SF_GLYPH_FIRST];
+    if (g->ready) return g;
+
+    g->glyph_index = stbtt_FindGlyphIndex(&sf_font, c);
+    if (g->glyph_index) {
+        int lsb, x1, y1;
+        stbtt_GetGlyphHMetrics(&sf_font, g->glyph_index, &g->advance, &lsb);
+        stbtt_GetGlyphBitmapBox(&sf_font, g->glyph_index,
+                                sf_font_scale, sf_font_scale,
+                                &g->x0, &g->y0, &x1, &y1);
+        g->w = x1 - g->x0;
+        g->h = y1 - g->y0;
+        if (g->w > 0 && g->h > 0 &&
+            g->w <= SF_GLYPH_MAX && g->h <= SF_GLYPH_MAX)
+            stbtt_MakeGlyphBitmap(&sf_font, g->bitmap, g->w, g->h, g->w,
+                                  sf_font_scale, sf_font_scale, g->glyph_index);
+        else
+            g->w = g->h = 0;
+    }
+    g->ready = 1;
+    return g;
+}
 /* theme colours (RGB565); defaults ~ white text, accent pill, dark sel-text */
 static uint16_t sf_col_text = 0xFFFF, sf_col_sel = 0x2FE6, sf_col_seltext = 0x0000;
 
@@ -995,6 +1037,9 @@ static uint16_t sf_col_text = 0xFFFF, sf_col_sel = 0x2FE6, sf_col_seltext = 0x00
  * path points them at a panel-sized buffer and presents it 1:1. */
 static uint16_t *sf_tgt = NULL; static int sf_tw = 0, sf_th = 0;
 static uint16_t *sf_menu_fb = NULL; static int sf_pw = 0, sf_ph = 0;
+enum { SF_MENU_STAGE_COUNT = 3 };
+static uint16_t *sf_menu_stage[SF_MENU_STAGE_COUNT];
+static int sf_menu_stage_idx;
 static void sf_read_panel(void) {
     if (sf_pw) return;
     sf_pw = 640; sf_ph = 480;                 /* R36SX default */
@@ -1046,6 +1091,10 @@ static void sf_font_init(void) {
         int asc, desc, gap; stbtt_GetFontVMetrics(&sf_font, &asc, &desc, &gap);
         sf_font_asc = (int)(asc * sf_font_scale + 0.5f);
         sf_font_ready = 1;
+        memset(sf_glyphs, 0, sizeof sf_glyphs);
+        /* Pre-warm at menu entry, never during a visible redraw. */
+        for (int c = SF_GLYPH_FIRST; c <= SF_GLYPH_LAST; c++)
+            sf_glyph_get((unsigned char)c);
         sf_load_skin();
         return;
     }
@@ -1054,10 +1103,10 @@ static int sf_text_w(const char *s) {
     if (sf_font_ready != 1) return (int)strlen(s) * 8;
     int w = 0, prev = 0;
     for (; *s; s++) {
-        int gi = stbtt_FindGlyphIndex(&sf_font, (unsigned char)*s);
-        int adv, lsb; stbtt_GetGlyphHMetrics(&sf_font, gi, &adv, &lsb);
-        if (prev) w += (int)(stbtt_GetGlyphKernAdvance(&sf_font, prev, gi) * sf_font_scale);
-        w += (int)(adv * sf_font_scale); prev = gi;
+        sf_glyph_t *g = sf_glyph_get((unsigned char)*s);
+        if (!g || !g->glyph_index) { w += 8; prev = 0; continue; }
+        if (prev) w += (int)(stbtt_GetGlyphKernAdvance(&sf_font, prev, g->glyph_index) * sf_font_scale);
+        w += (int)(g->advance * sf_font_scale); prev = g->glyph_index;
     }
     return w;
 }
@@ -1069,21 +1118,17 @@ static void sf_text(int x, int y, const char *s, uint16_t color) {
     int pen = x, prev = 0;
     int cr = (color >> 11) & 0x1f, cg = (color >> 5) & 0x3f, cb = color & 0x1f;
     for (; *s; s++) {
-        int gi = stbtt_FindGlyphIndex(&sf_font, (unsigned char)*s);
-        if (prev) pen += (int)(stbtt_GetGlyphKernAdvance(&sf_font, prev, gi) * sf_font_scale);
-        int x0,y0,x1,y1;
-        stbtt_GetGlyphBitmapBox(&sf_font, gi, sf_font_scale, sf_font_scale, &x0,&y0,&x1,&y1);
-        int gw = x1-x0, gh = y1-y0;
-        if (gw > 0 && gh > 0 && gw < 64 && gh < 64) {
-            unsigned char bmp[64*64];
-            stbtt_MakeGlyphBitmap(&sf_font, bmp, gw, gh, gw, sf_font_scale, sf_font_scale, gi);
-            for (int j = 0; j < gh; j++) {
-                int py = y + sf_font_asc + y0 + j;
+        sf_glyph_t *g = sf_glyph_get((unsigned char)*s);
+        if (!g || !g->glyph_index) { pen += 8; prev = 0; continue; }
+        if (prev) pen += (int)(stbtt_GetGlyphKernAdvance(&sf_font, prev, g->glyph_index) * sf_font_scale);
+        if (g->w > 0 && g->h > 0) {
+            for (int j = 0; j < g->h; j++) {
+                int py = y + sf_font_asc + g->y0 + j;
                 if (py < 0 || py >= sf_th) continue;
                 uint16_t *row = sf_tgt + py * sf_tw;
-                for (int i = 0; i < gw; i++) {
-                    int a = bmp[j*gw+i]; if (!a) continue;
-                    int px = pen + x0 + i; if (px < 0 || px >= sf_tw) continue;
+                for (int i = 0; i < g->w; i++) {
+                    int a = g->bitmap[j*g->w+i]; if (!a) continue;
+                    int px = pen + g->x0 + i; if (px < 0 || px >= sf_tw) continue;
                     uint16_t d = row[px];
                     int dr=(d>>11)&0x1f, dg=(d>>5)&0x3f, db=d&0x1f, ia=255-a;
                     int rr=(cr*a+dr*ia)/255, rg=(cg*a+dg*ia)/255, rb=(cb*a+db*ia)/255;
@@ -1091,8 +1136,7 @@ static void sf_text(int x, int y, const char *s, uint16_t color) {
                 }
             }
         }
-        int adv, lsb; stbtt_GetGlyphHMetrics(&sf_font, gi, &adv, &lsb);
-        pen += (int)(adv * sf_font_scale); prev = gi;
+        pen += (int)(g->advance * sf_font_scale); prev = g->glyph_index;
     }
 }
 /* Themed-menu API exposed to frontend.c (its ShowMenu uses these). */
@@ -1184,7 +1228,23 @@ void sf3000_menu_present(void) {
     if (!sf_menu_fb) return;
     hwdisp_set_target_aspect(0, 0);   /* fill panel, no pad */
     hwdisp_set_filter(0);
-    hwdisp_present(sf_menu_fb, sf_pw, sf_ph, sf_pw * 2);
+    /* disp_frame DMA-reads asynchronously. Never hand it sf_menu_fb: the next
+     * scroll redraw clears and modifies that buffer while slower SF3500 units
+     * may still be scanning it, producing diagonally displaced/flickering text.
+     * Rotate stable copies exactly as picoarch does for SF3500 menu frames.
+     * This is menu-only; the high-frequency PS1 gameplay path stays untouched. */
+    size_t bytes = (size_t)sf_pw * sf_ph * sizeof(uint16_t);
+    if (!sf_menu_stage[0]) {
+        for (int i = 0; i < SF_MENU_STAGE_COUNT; i++)
+            sf_menu_stage[i] = (uint16_t*)malloc(bytes);
+    }
+    uint16_t *present = sf_menu_fb;
+    if (sf_menu_stage[0] && sf_menu_stage[1] && sf_menu_stage[2]) {
+        present = sf_menu_stage[sf_menu_stage_idx];
+        sf_menu_stage_idx = (sf_menu_stage_idx + 1) % SF_MENU_STAGE_COUNT;
+        memcpy(present, sf_menu_fb, bytes);
+    }
+    hwdisp_present(present, sf_pw, sf_ph, sf_pw * 2);
     sf_tgt = SCREEN; sf_tw = SCREEN_WIDTH; sf_th = SCREEN_HEIGHT;  /* restore */
 }
 int  sf3000_panel_w(void) { sf_read_panel(); return sf_pw; }
