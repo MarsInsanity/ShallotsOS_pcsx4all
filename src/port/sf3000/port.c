@@ -18,6 +18,7 @@
 #include <sys/time.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
+#include <arpa/inet.h>
 #include <linux/fb.h>
 #include <time.h>
 #include <math.h>
@@ -248,6 +249,46 @@ static int display_init(void) {
     plog("display_init: HW path active");
     fprintf(stderr, "display_init: HW path active\n");
     return 0;
+}
+
+static void reopen_speaker_amp(void) {
+    char env[512] = {0};
+    int fd = open("/tmp/tfdevice.env", O_RDONLY);
+    if (fd < 0) return;
+    int n = read(fd, env, sizeof(env) - 1);
+    close(fd);
+    if (n <= 0 || (!strstr(env, "TF_DEVICE=R36HD\n") &&
+                   !strstr(env, "TF_DEVICE=R36SX\n"))) {
+        plog("audio amp: unsupported device; left unchanged");
+        return;
+    }
+
+    uint32_t cell;
+    fd = open("/proc/device-tree/panel/speaker-output", O_RDONLY);
+    if (fd < 0 || read(fd, &cell, sizeof(cell)) != sizeof(cell)) {
+        if (fd >= 0) close(fd);
+        plog("audio amp: speaker-output unavailable; left unchanged");
+        return;
+    }
+    close(fd);
+    uint32_t pin = ntohl(cell);
+    if (pin > 31) {
+        plog("audio amp: speaker pin out of range; left unchanged");
+        return;
+    }
+
+    fd = open("/dev/mem", O_RDWR | O_SYNC);
+    if (fd < 0) return;
+    void *mapping = mmap(NULL, 0x2020, PROT_READ | PROT_WRITE, MAP_SHARED,
+                         fd, 0x18800000);
+    close(fd);
+    if (mapping == MAP_FAILED) return;
+    volatile uint32_t *gpio_l = (volatile uint32_t *)((char *)mapping + 0x44);
+    uint32_t bit = 1u << pin;
+    gpio_l[5] |= bit;
+    gpio_l[4] &= ~bit;
+    munmap(mapping, 0x2020);
+    plog("audio amp: R36 speaker output enabled");
 }
 
 /* PSX aspect normalize to 4:3. PSX pixels are non-square and every mode is meant
@@ -1751,6 +1792,7 @@ int main(int argc, char *argv[]) {
     mkdir(cheatsdir, 0755);
 
     if (psxInit() == -1) { plog("psxInit FAILED"); return 1; }
+    reopen_speaker_amp();
     {
         extern R3000Acpu psxRec;
         plog(psxCpu == &psxRec ? "dynarec ACTIVE" : "INTERPRETER (slow!)");

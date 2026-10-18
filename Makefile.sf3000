@@ -91,6 +91,8 @@ OBJS += obj/recompiler/mips/recompiler.o \
         obj/recompiler/mips/mips_codegen.o \
         obj/recompiler/mips/mips_disasm.o
 
+OBJS += obj/port/sf3000/tf_audio_queue.o
+
 OBJS += obj/port/$(PORT)/port.o obj/port/$(PORT)/fonts.o obj/port/$(PORT)/hwdisp.o
 OBJS += obj/port/common/frontend.o obj/port/common/cdrom_hacks.o
 OBJS += obj/plugin_lib/perfmon.o obj/plugin_lib/plugin_lib.o \
