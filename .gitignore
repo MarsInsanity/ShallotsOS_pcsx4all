@@ -15,3 +15,5 @@ stdout.txt
 err.txt
 *.ipk
 *.cue
+upstream/
+build/

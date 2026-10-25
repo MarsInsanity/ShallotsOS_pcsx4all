@@ -2226,47 +2226,39 @@ static void ShowMenuItem(int x, int y, MENUITEM *mi)
   }
 }
 
-/* Themed row: name + showval, pill highlight when selected. */
-static void ShowMenuItemThemed(int x, int y, MENUITEM *mi, int selected)
+extern void sf3000_list_draw(int n, const char *const *names, const char *const *values,
+                             const int *can_change, int sel);
+
+/* ShallotsOS draws these pages like picoarch's Options lists; there, B goes
+ * back, so the "Back to main menu" rows and blank separators are left out. */
+static int mi_hidden(MENUITEM *mi)
 {
-  static char string[PATH_MAX];
-  if (!mi->name) return;
-  if (mi->showval) sprintf(string, "%s %s", mi->name, (*mi->showval)());
-  else             snprintf(string, sizeof string, "%s", mi->name);
-  int fh = sf3000_menu_font_h();
-  if (selected) {
-    int w = sf3000_menu_text_w(string) + 24;
-    if (w > SCREEN_WIDTH - (x - 6) * 2) w = SCREEN_WIDTH - (x - 6) * 2;
-    sf3000_menu_pill(x - 6, y - 4, w, fh + 6, sf3000_col_sel());
-    sf3000_menu_text(x + 6, y, string, sf3000_col_seltext());
-  } else {
-    sf3000_menu_text(x + 6, y, string, sf3000_col_text());
-  }
+  return !mi->name || !strncmp(mi->name, "Back", 4);
 }
 
 static void ShowMenu(MENU *menu)
 {
-  /* Themed path: panel-res buffer, TTF font, theme colours, pill, scroll. */
-  if (sf3000_menu_begin()) {
-    int pw = sf3000_panel_w(), ph = sf3000_panel_h();
-    int fh = sf3000_menu_font_h();
-    int rowh = fh + 8, pad = 14;
-    int header_h = rowh + 6;
-    int vis = (ph - header_h - pad) / rowh;
-    if (vis < 1) vis = 1; if (vis > menu->num) vis = menu->num;
-    int top = 0;
-    if (menu->cur >= vis) top = menu->cur - vis + 1;
-    if (top > menu->num - vis) top = menu->num - vis; if (top < 0) top = 0;
-    sf3000_menu_text(pad, pad, ">>> PCSX4ALL", sf3000_col_sel());
-    sf3000_menu_battery();
-    int y0 = pad + header_h;
-    for (int i = 0; i < vis; i++) {
-      int idx = top + i;
-      ShowMenuItemThemed(pad, y0 + i * rowh, menu->m + idx, idx == menu->cur);
+  if (sf3000_menu_ready()) {
+    static char names[64][64], values[64][64];
+    const char *np[64], *vp[64];
+    int cc[64], n = 0, sel = 0;
+    for (int i = 0; i < menu->num && n < 64; i++) {
+      MENUITEM *mi = menu->m + i;
+      if (mi_hidden(mi)) continue;
+      if (i == menu->cur) sel = n;
+      snprintf(names[n], sizeof names[n], "%s", mi->name);
+      for (int e = (int)strlen(names[n]) - 1; e >= 0 && (names[n][e] == ' ' || names[n][e] == ':'); e--)
+        names[n][e] = '\0';
+      values[n][0] = '\0';
+      if (mi->showval) {
+        snprintf(values[n], sizeof values[n], "%s", (*mi->showval)());
+        if (values[n][0] >= 'a' && values[n][0] <= 'z') values[n][0] -= 32;
+      }
+      np[n] = names[n]; vp[n] = values[n];
+      cc[n] = mi->on_press != NULL;
+      n++;
     }
-    if (top > 0)               sf3000_menu_text(pw - pad - 12, y0, "^", sf3000_col_text());
-    if (top + vis < menu->num) sf3000_menu_text(pw - pad - 12, y0 + (vis-1)*rowh, "v", sf3000_col_text());
-    sf3000_menu_present();
+    sf3000_list_draw(n, np, vp, cc, sel);
     return;
   }
 
@@ -2321,6 +2313,8 @@ static int gui_RunMenu(MENU *menu)
 	u32 keys;
 	if (menu->page_num == 0) menu->page_num = menu->num;
 	menu->cur_top = 0;
+	for (int i = 0; i < menu->num && mi_hidden(menu->m + menu->cur); i++)
+		menu->cur = (menu->cur + 1) % menu->num;
 	if (menu->cur >= menu->page_num) menu->cur_top = menu->cur - menu->page_num + 1;
 
   for (;;)
@@ -2349,7 +2343,7 @@ static int gui_RunMenu(MENU *menu)
         if (--menu->cur < 0)
           menu->cur = menu->num - 1;
       }
-      while (!(menu->m + menu->cur)->name);   // Skip over an empty menu entry.
+      while (mi_hidden(menu->m + menu->cur));   // Skip over an empty menu entry.
       fix_menu_top(menu);
 
     }
@@ -2360,7 +2354,7 @@ static int gui_RunMenu(MENU *menu)
         if (++menu->cur == menu->num)
           menu->cur = 0;
       }
-      while (!(menu->m + menu->cur)->name);   // Skip over an empty menu entry.
+      while (mi_hidden(menu->m + menu->cur));   // Skip over an empty menu entry.
       fix_menu_top(menu);
     }
     else if (keys & KEY_A)
@@ -2376,9 +2370,11 @@ static int gui_RunMenu(MENU *menu)
     }
     else if (keys & KEY_B)
     {
-      menu->cur = menu->num - 1;
+      /* B = back, as everywhere in ShallotsOS. */
+      while (key_read() != 0)
+        timer_delay(50);
       key_reset();
-      fix_menu_top(menu);
+      return 0;
     }
 
     if ((keys & (KEY_LEFT | KEY_RIGHT)))
@@ -2418,3 +2414,10 @@ int GameMenu()
   video_flip();
   return gui_RunMenu(&gui_GameMenu);
 }
+
+/* ShallotsOS's in-game menu (port.c) opens these pages from its Options. */
+int sf3000_open_core_settings(void) { return gui_Settings(); }
+int sf3000_open_gpu_settings(void) { return gui_GPUSettings(); }
+int sf3000_open_spu_settings(void) { return gui_SPUSettings(); }
+int sf3000_open_cheats(void) { return gui_Cheats(); }
+int sf3000_swap_cd(void) { return gui_swap_cd(); }
