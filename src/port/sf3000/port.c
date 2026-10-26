@@ -685,11 +685,10 @@ uint16_t pad_read(int num) { return (num == 0 ? pad1 : 0xFFFF); }
 /* --------------------------------------------------------------------------
  * Video API
  * -------------------------------------------------------------------------- */
-static void sh_toast_draw(void);
+static void sh_fps_draw(void);
 void video_flip(void) {
-    if (Config.ShowFps) port_printf(2, 2, pl_data.stats_msg);
     gamma_apply(SCREEN, SCREEN_WIDTH * SCREEN_HEIGHT);
-    sh_toast_draw();
+    if (Config.ShowFps) sh_fps_draw();
     PROF_PRESENT_BEGIN();
     display_blit(SCREEN, SCREEN_WIDTH, SCREEN_HEIGHT, SCREEN_WIDTH * 2);
     PROF_PRESENT_END();
@@ -1337,7 +1336,6 @@ static uint16_t *sh_read_bmp(const char *path, int *w, int *h) {
  * clear SCREEN), used as the menu background and for state screenshots. */
 static uint16_t *sh_bg;
 static int sh_bg_w, sh_bg_h, sh_bg_valid;
-static int sh_in_menu;   /* SCREEN may have been cleared by a PCSX page */
 static void sh_bg_capture(void) {
     if (!SCREEN || SCREEN_WIDTH <= 0 || SCREEN_HEIGHT <= 0) return;
     size_t n = (size_t)SCREEN_WIDTH * SCREEN_HEIGHT;
@@ -1379,36 +1377,140 @@ static void sh_mark_resume(int on) {
     else unlink(p);
 }
 
-/* ---- In-game toast (picoarch's HUD card, top left of the game frame) ------ */
-static char sh_toast_msg[64];
+/* ---- Toast and FPS counter, as picoarch draws them -------------------------
+ * Toasts ("Saved to slot 1") go on cubevol's OSD plane, /dev/fb1, which sits
+ * above the game at panel resolution: a dark rounded card centred above the
+ * bottom edge in the menu font at 22 px, for 2 s (picoarch's fb1_toast). One
+ * asked for in the menu shows once the game is back. The FPS counter is
+ * picoarch's HUD card: "FPS: rendered (emulated)" on a dark card at the top
+ * left of the game frame, sized to the frame. */
+static char sh_toast_pending[96];
 static long long sh_toast_until;
-static void sh_toast(const char *msg) {
-    snprintf(sh_toast_msg, sizeof sh_toast_msg, "%s", msg);
-    sh_toast_until = sh_ms() + 2000;
-}
-static void sh_toast_draw(void) {
-    if (!sh_toast_msg[0] || sh_ms() > sh_toast_until || !SCREEN) { sh_toast_msg[0] = 0; return; }
-    if (sf_font_ready != 1) return;
+static int sh_toast_x, sh_toast_y, sh_toast_w, sh_toast_h;
+static int sh_in_menu;   /* SCREEN may have been cleared by a PCSX page */
+
+static int sh_fb1_toast(const char *text) {
+    sf_font_init();
+    if (!text || !*text || sf_font_ready != 1) return 0;
+    int fd = open("/dev/fb1", O_RDWR);
+    if (fd < 0) return 0;
+    struct fb_var_screeninfo vi;
+    struct fb_fix_screeninfo fi;
+    if (ioctl(fd, FBIOGET_VSCREENINFO, &vi) != 0 || ioctl(fd, FBIOGET_FSCREENINFO, &fi) != 0 ||
+        vi.bits_per_pixel != 32 || vi.xres < vi.yres || vi.xres > 1920) { close(fd); return 0; }
+    uint8_t *mem = mmap(NULL, fi.smem_len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (mem == MAP_FAILED) { close(fd); return 0; }
+    int W = vi.xres, H = vi.yres;
     uint16_t *save_t = sf_tgt; int save_w = sf_tw, save_h = sf_th;
-    sf_tgt = SCREEN; sf_tw = SCREEN_WIDTH; sf_th = SCREEN_HEIGHT;
-    int H = SCREEN_HEIGHT;
+    sf_set_px(22.0f);
+    int tw = sf_text_w(text);
+    int bw = tw + 40, bh = 44;
+    if (bw > W - 20) bw = W - 20;
+    int bx = (W - bw) / 2, by = H - 60 - 12 - bh;
+    uint16_t *card = calloc((size_t)bw * bh, sizeof *card);
+    if (card) {
+        sf_tgt = card; sf_tw = bw; sf_th = bh;
+        sf_text((bw - tw) / 2 > 4 ? (bw - tw) / 2 : 4, bh / 2 - (sf_cur->asc - sf_cur->cap / 2), text, 0xFFFF);
+        sf_tgt = save_t; sf_tw = save_w; sf_th = save_h;
+        const int r = 12;
+        for (int y = 0; y < bh; y++) {
+            uint32_t *row = (uint32_t *)(mem + (size_t)(by + y) * fi.line_length) + bx;
+            for (int x = 0; x < bw; x++) {
+                int dx = x < r ? r - x : (x >= bw - r ? x - (bw - r - 1) : 0);
+                int dy = y < r ? r - y : (y >= bh - r ? y - (bh - r - 1) : 0);
+                if (dx * dx + dy * dy > r * r) { row[x] = 0; continue; }
+                uint16_t c = card[y * bw + x];
+                uint32_t rr = (c >> 11) * 255 / 31, gg = ((c >> 5) & 63) * 255 / 63, b = (c & 31) * 255 / 31;
+                /* Text pixels opaque, the card itself ~80% black. */
+                row[x] = c ? (0xFFu << 24) | (rr << 16) | (gg << 8) | b : 0xD2000000u;
+            }
+        }
+        free(card);
+    }
+    munmap(mem, fi.smem_len);
+    ioctl(fd, FBIOBLANK, FB_BLANK_UNBLANK);
+    close(fd);
+    sh_toast_until = sh_ms() + 2000;
+    sh_toast_x = bx; sh_toast_y = by; sh_toast_w = bw; sh_toast_h = bh;
+    return card != NULL;
+}
+static void sh_toast(const char *msg) {
+    if (sh_in_menu) snprintf(sh_toast_pending, sizeof sh_toast_pending, "%s", msg);
+    else sh_fb1_toast(msg);
+}
+/* Every frame: show a pending toast, clear an expired one (only the card:
+ * cubevol redraws its own OSD only on a change). */
+static void sh_toast_tick(void) {
+    if (sh_toast_pending[0]) {
+        char t[96];
+        snprintf(t, sizeof t, "%s", sh_toast_pending);
+        sh_toast_pending[0] = '\0';
+        sh_fb1_toast(t);
+        return;
+    }
+    if (!sh_toast_until || sh_ms() < sh_toast_until) return;
+    sh_toast_until = 0;
+    int fd = open("/dev/fb1", O_RDWR);
+    if (fd < 0) return;
+    struct fb_fix_screeninfo fi;
+    if (ioctl(fd, FBIOGET_FSCREENINFO, &fi) == 0) {
+        uint8_t *mem = mmap(NULL, fi.smem_len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (mem != MAP_FAILED) {
+            for (int y = 0; y < sh_toast_h; y++)
+                memset(mem + (size_t)(sh_toast_y + y) * fi.line_length + (size_t)sh_toast_x * 4, 0,
+                       (size_t)sh_toast_w * 4);
+            munmap(mem, fi.smem_len);
+        }
+    }
+    close(fd);
+}
+
+/* picoarch's HUD card, drawn into the game frame before it is presented. */
+static void sh_hud_draw(const char *msg) {
+    sf_font_init();
+    if (!SCREEN || sf_font_ready != 1 || !msg[0]) return;
+    uint16_t *save_t = sf_tgt; int save_w = sf_tw, save_h = sf_th;
+    int W = SCREEN_WIDTH, H = SCREEN_HEIGHT;
     float px = 20.0f * H / 480; if (px < 9) px = 9;
     sf_set_px(px);
-    int tw = sf_text_w(sh_toast_msg), pad = (int)(px * 0.7f) + 1;
+    int tw = sf_text_w(msg), pad = (int)(px * 0.7f) + 1;
     int w = tw + pad * 2, h = (int)(px * 1.8f) + 1, m = H / 60 + 2, r = h / 3;
+    uint16_t *card = calloc((size_t)w * h, sizeof *card);
+    if (!card) return;
+    sf_tgt = card; sf_tw = w; sf_th = h;
+    sf_text(pad, h / 2 - (sf_cur->asc - sf_cur->cap / 2), msg, 0xFFFF);
+    sf_tgt = save_t; sf_tw = save_w; sf_th = save_h;
     for (int y = 0; y < h && m + y < H; y++) {
-        uint16_t *d = SCREEN + (size_t)(m + y) * SCREEN_WIDTH + m;
-        for (int x = 0; x < w && m + x < SCREEN_WIDTH; x++) {
+        uint16_t *d = SCREEN + (size_t)(m + y) * W + m;
+        for (int x = 0; x < w && m + x < W; x++) {
             int dx = x < r ? r - x : (x >= w - r ? x - (w - r - 1) : 0);
             int dy = y < r ? r - y : (y >= h - r ? y - (h - r - 1) : 0);
             if (dx * dx + dy * dy > r * r) continue;
-            unsigned c = d[x], k = 45;   /* 210/255 dark */
-            d[x] = (uint16_t)(((((c >> 11) & 31) * k / 255) << 11) |
-                              ((((c >> 5) & 63) * k / 255) << 5) | ((c & 31) * k / 255));
+            uint16_t c = card[y * w + x];
+            if (c) { d[x] = c; continue; }
+            unsigned v = d[x], k = 255 - 210;
+            d[x] = (uint16_t)(((((v >> 11) & 31) * k / 255) << 11) |
+                              ((((v >> 5) & 63) * k / 255) << 5) | ((v & 31) * k / 255));
         }
     }
-    sf_text(m + pad, m + h / 2 - (sf_cur->asc - sf_cur->cap / 2), sh_toast_msg, 0xFFFF);
-    sf_tgt = save_t; sf_tw = save_w; sf_th = save_h;
+    free(card);
+}
+
+/* FPS as picoarch counts it: frames shown and frames emulated per second. */
+static unsigned sh_frames_shown, sh_frames_run;
+static void sh_fps_draw(void) {
+    static long long t0;
+    static char msg[48];
+    long long now = sh_ms();
+    sh_frames_shown++;
+    if (!t0) t0 = now;
+    if (now - t0 >= 1000) {
+        double s = (now - t0) / 1000.0;
+        snprintf(msg, sizeof msg, "FPS: %.1f (%.0f)", sh_frames_shown / s, sh_frames_run / s);
+        sh_frames_shown = sh_frames_run = 0;
+        t0 = now;
+    }
+    sh_hud_draw(msg);
 }
 
 /* ---- Drawing, as picoarch's menu.c --------------------------------------- */
@@ -1642,8 +1744,9 @@ static void sh_menu_video(void) {
     int sel = 0;
     sh_input_t in; sh_input_begin(&in);
     for (;;) {
-        sh_row_t r[8]; memset(r, 0, sizeof r);
+        sh_row_t r[9]; memset(r, 0, sizeof r);
         int n = 0;
+        snprintf(r[n].name, 64, "Show FPS"); sh_onoff(r[n].value, 64, Config.ShowFps); r[n++].can_change = 1;
         snprintf(r[n].name, 64, "Aspect ratio");
         snprintf(r[n].value, 64, "%s", scale_mode == 1 ? "Fullscreen" : "Aspect-Correct"); r[n++].can_change = 1;
         snprintf(r[n].name, 64, "Gamma");
@@ -1664,18 +1767,19 @@ static void sh_menu_video(void) {
         int step = (k & SH_RIGHT) ? 1 : (k & SH_LEFT) ? -1 : (k & SH_A) ? 1 : 0;
         if (!step) continue;
         switch (sel) {
-        case 0: scale_mode = !scale_mode; sh_apply_scale(); break;
-        case 1:
+        case 0: Config.ShowFps = !Config.ShowFps; break;
+        case 1: scale_mode = !scale_mode; sh_apply_scale(); break;
+        case 2:
             if (k & SH_A) gamma_percent = gamma_percent > 100 ? 100 : 130;
             else gamma_percent += step * 10;
             if (gamma_percent < 100) gamma_percent = 100;
             if (gamma_percent > 250) gamma_percent = 250;
             break;
-        case 2: gpu_unai_config_ext.pixel_skip = !gpu_unai_config_ext.pixel_skip; break;
-        case 3: gpu_unai_config_ext.ilace_force = !gpu_unai_config_ext.ilace_force; break;
-        case 4: hires_fix = !hires_fix; break;
-        case 5: if (k & SH_A) { sh_run_frontend(sf3000_open_gpu_settings); sh_input_begin(&in); } break;
-        case 6: if (k & SH_A) { sh_run_frontend(sf3000_open_spu_settings); sh_input_begin(&in); } break;
+        case 3: gpu_unai_config_ext.pixel_skip = !gpu_unai_config_ext.pixel_skip; break;
+        case 4: gpu_unai_config_ext.ilace_force = !gpu_unai_config_ext.ilace_force; break;
+        case 5: hires_fix = !hires_fix; break;
+        case 6: if (k & SH_A) { sh_run_frontend(sf3000_open_gpu_settings); sh_input_begin(&in); } break;
+        case 7: if (k & SH_A) { sh_run_frontend(sf3000_open_spu_settings); sh_input_begin(&in); } break;
         }
     }
 }
@@ -2082,6 +2186,8 @@ static void sh_first_frame(void) {
 void pad_update(void) {
     static int first = 1;
     if (first) { first = 0; sh_first_frame(); }
+    sh_frames_run++;
+    sh_toast_tick();
     sh_power_watch();
     if (!cv_keys) return;
     uint32_t k = *cv_keys;
