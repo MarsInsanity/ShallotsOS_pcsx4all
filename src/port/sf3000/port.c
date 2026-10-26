@@ -1843,12 +1843,48 @@ static void sh_menu_config(void) {
     }
 }
 
-static void sh_menu_options(void) {
-    static const char *names[] = { "Audio and video", "Emulator options", "Player controls", "Save config" };
-    int sel = 0, n = 4;
+/* About, as picoarch's: the emulator and game in full. */
+static void sh_menu_about(void) {
+    extern R3000Acpu psxRec;
+    int sel = 0;
     sh_input_t in; sh_input_begin(&in);
     for (;;) {
-        sh_row_t r[4]; memset(r, 0, sizeof r);
+        sh_row_t r[8]; memset(r, 0, sizeof r);
+        int n = 0;
+        const char *b = strrchr(g_rom_path, '/');
+        snprintf(r[n].name, 64, "Emulator"); snprintf(r[n++].value, 64, "PCSX4ALL");
+        snprintf(r[n].name, 64, "Version"); snprintf(r[n++].value, 64, "ShallotsOS, %s", __DATE__);
+        snprintf(r[n].name, 64, "CPU"); snprintf(r[n++].value, 64, "%s",
+                 psxCpu == &psxRec ? "Recompiler" : "Interpreter (slow)");
+        snprintf(r[n].name, 64, "Game"); snprintf(r[n++].value, 64, "%s", b ? b + 1 : g_rom_path);
+        snprintf(r[n].name, 64, "Disc ID"); snprintf(r[n++].value, 64, "%s", CdromId[0] ? CdromId : "-");
+        snprintf(r[n].name, 64, "BIOS"); snprintf(r[n++].value, 64, "%s",
+                 Config.HLE ? "HLE (no BIOS file)" : Config.Bios);
+        snprintf(r[n].name, 64, "Video"); snprintf(r[n++].value, 64, "%dx%d", SCREEN_WIDTH, SCREEN_HEIGHT);
+        for (int i = 0; i < n; i++) {
+            /* Keep long values (the game's file name) clear of the name. */
+            char *v = r[i].value;
+            while (v[0] && sf_text_w(v) > sf_pw * 2 / 3) {
+                size_t len = strlen(v);
+                if (len <= 4) { v[0] = 0; break; }
+                v[len - 4] = 0; strcat(v, "...");
+            }
+        }
+        sh_draw_list(r, n, sel, NULL);
+        usleep(16000);
+        int k = sh_input_poll(&in);
+        if (k & SH_B) return;
+        if (k & SH_UP) sel = (sel + n - 1) % n;
+        if (k & SH_DOWN) sel = (sel + 1) % n;
+    }
+}
+
+static void sh_menu_options(void) {
+    static const char *names[] = { "Audio and video", "Emulator options", "Player controls", "Save config", "About" };
+    int sel = 0, n = 5;
+    sh_input_t in; sh_input_begin(&in);
+    for (;;) {
+        sh_row_t r[5]; memset(r, 0, sizeof r);
         for (int i = 0; i < n; i++) snprintf(r[i].name, 64, "%s", names[i]);
         sh_draw_list(r, n, sel, NULL);
         usleep(16000);
@@ -1862,6 +1898,7 @@ static void sh_menu_options(void) {
             if (sel == 1) sh_run_frontend(sf3000_open_core_settings);
             if (sel == 2) sh_menu_controls();
             if (sel == 3) sh_menu_config();
+            if (sel == 4) sh_menu_about();
             sh_wait_release();
             sh_input_begin(&in);
         }
