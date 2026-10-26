@@ -593,10 +593,12 @@ static const char *pb_name[PB_COUNT] =
     { "Cross (X)", "Circle (O)", "Square", "Triangle", "L1", "R1", "L2", "R2" };
 static const uint16_t pb_mask[PB_COUNT] =
     { PSX_CROSS, PSX_CIRCLE, PSX_SQUARE, PSX_TRIANGLE, PSX_L1, PSX_R1, PSX_L2, PSX_R2 };
-/* Positional: PSX face button -> physical button in the same position. On these
- * pads A=south, B=east, X=north, Y=west, so: Cross(S)->A, Circle(E)->B,
- * Square(W)->Y, Triangle(N)->X. The on-screen "press Cross" = the south button. */
-static int pb_bind[PB_COUNT] = { CV_A, CV_B, CV_Y, CV_X, CV_L, CV_R, CV_L2, CV_R2 };
+/* Positional: PSX face button -> physical button in the same position, as on a
+ * real PlayStation pad and as PCSX ReARMed does. These consoles have the
+ * Nintendo layout, A=east, B=south, X=north, Y=west (picoarch's calibrated
+ * keymap), so: Cross(S)->B, Circle(E)->A, Square(W)->Y, Triangle(N)->X.
+ * (TreeFrog's default had Cross and Circle swapped, assuming A was south.) */
+static int pb_bind[PB_COUNT] = { CV_B, CV_A, CV_Y, CV_X, CV_L, CV_R, CV_L2, CV_R2 };
 
 /* Physical buttons the user can bind to (label + CV bit). */
 static const struct { const char *name; int bit; } cv_btns[] = {
@@ -2434,8 +2436,24 @@ static void config_write(const char *path);
  * displayed frame. Upgrade only those old defaults; all user controls, BIOS,
  * video quality, and per-game settings remain intact. Once rewritten as v1,
  * an explicit user choice of either setting is respected. */
+static int config_migrate_binds(void) {
+    if (pb_bind[PB_CROSS] == CV_A && pb_bind[PB_CIRCLE] == CV_B) {
+        pb_bind[PB_CROSS] = CV_B;
+        pb_bind[PB_CIRCLE] = CV_A;
+        return 1;
+    }
+    return 0;
+}
 static int config_migrate_v0(void) {
     int changed = 0;
+    /* v1 and older saved TreeFrog's swapped face buttons (Cross on A, the
+     * east button). A config that still has exactly that pair gets the
+     * PlayStation layout; anything else was the user's own choice. */
+    if (pb_bind[PB_CROSS] == CV_A && pb_bind[PB_CIRCLE] == CV_B) {
+        pb_bind[PB_CROSS] = CV_B;
+        pb_bind[PB_CIRCLE] = CV_A;
+        changed = 1;
+    }
     if (Config.SpuUpdateFreq == SPU_UPDATE_FREQ_16) {
         Config.SpuUpdateFreq = SPU_UPDATE_FREQ_1;
         changed = 1;
@@ -2452,13 +2470,15 @@ void config_load(void) {
     char p[PATH_MAX];
     snprintf(p, sizeof p, "%s/pcsx4all.cfg", homedir);
     int version = config_read(p);
-    if (version == 0) {
-        config_migrate_v0();
+    if (version >= 0 && version < CONFIG_VERSION) {
+        if (version == 0) config_migrate_v0();
+        else config_migrate_binds();
         config_write(p);
     }
     config_game_path(p, sizeof p);
     version = config_read(p);   /* no-op if absent; overrides global */
-    if (version == 0 && config_migrate_v0())
+    if (version >= 0 && version < CONFIG_VERSION &&
+        (version == 0 ? config_migrate_v0() : config_migrate_binds()))
         config_write(p);
 }
 

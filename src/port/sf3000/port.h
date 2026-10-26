@@ -36,7 +36,7 @@ struct ps1_controller {
 
 extern struct ps1_controller player_controller[2];
 
-#define CONFIG_VERSION 1
+#define CONFIG_VERSION 2   /* 2: PlayStation face-button layout */
 
 unsigned get_ticks(void);
 void wait_ticks(unsigned s);
