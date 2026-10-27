@@ -1467,6 +1467,21 @@ static void sh_toast_tick(void) {
     close(fd);
 }
 
+/* How much wider than tall one frame pixel ends up on screen, so the card
+ * can be widened to look right: PS1 modes like 512x240 are stretched to
+ * 4:3, which squeezed the text to about half its width. */
+static float sh_hud_xscale(int W, int H) {
+    float ar;                                   /* the frame's shape on screen */
+    if (tf_is_r36sx()) ar = 4.0f / 3.0f;        /* always fills the 4:3 panel */
+    else if (scale_mode != 0) ar = 16.0f / 9.0f;
+    else if (hires_fix) ar = 4.0f / 3.0f;
+    else return 1.0f;                           /* padded: square pixels */
+    float sx = (float)W / ((float)H * ar);
+    if (sx < 0.5f) sx = 0.5f;
+    if (sx > 4.0f) sx = 4.0f;
+    return sx;
+}
+
 /* picoarch's HUD card, drawn into the game frame before it is presented. */
 static void sh_hud_draw(const char *msg) {
     sf_font_init();
@@ -1482,16 +1497,21 @@ static void sh_hud_draw(const char *msg) {
     sf_tgt = card; sf_tw = w; sf_th = h;
     sf_text(pad, h / 2 - (sf_cur->asc - sf_cur->cap / 2), msg, 0xFFFF);
     sf_tgt = save_t; sf_tw = save_w; sf_th = save_h;
+    float sx = sh_hud_xscale(W, H);
+    int dw = (int)(w * sx + 0.5f), mx = (int)(m * sx + 0.5f);
     for (int y = 0; y < h && m + y < H; y++) {
-        uint16_t *d = SCREEN + (size_t)(m + y) * W + m;
-        for (int x = 0; x < w && m + x < W; x++) {
+        uint16_t *d = SCREEN + (size_t)(m + y) * W + mx;
+        for (int ox = 0; ox < dw && mx + ox < W; ox++) {
+            int x = (int)(ox / sx);
+            if (x >= w) x = w - 1;
             int dx = x < r ? r - x : (x >= w - r ? x - (w - r - 1) : 0);
             int dy = y < r ? r - y : (y >= h - r ? y - (h - r - 1) : 0);
             if (dx * dx + dy * dy > r * r) continue;
             uint16_t c = card[y * w + x];
-            if (c) { d[x] = c; continue; }
-            unsigned v = d[x], k = 255 - 210;
-            d[x] = (uint16_t)(((((v >> 11) & 31) * k / 255) << 11) |
+            uint16_t *dp = &d[ox];
+            if (c) { *dp = c; continue; }
+            unsigned v = *dp, k = 255 - 210;
+            *dp = (uint16_t)(((((v >> 11) & 31) * k / 255) << 11) |
                               ((((v >> 5) & 63) * k / 255) << 5) | ((v & 31) * k / 255));
         }
     }
